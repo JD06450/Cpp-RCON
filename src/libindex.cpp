@@ -2,9 +2,15 @@
 
 #include <vector>
 
+std::string rcon_addr_t::to_string()
+{
+	return this->ip + ":" + std::to_string(this->port);
+}
+
 Rcon::Rcon(rcon_addr_t addr):
-_rcon_addr(addr),
-_connected(false)
+	_rcon_addr(addr),
+	_connected(false),
+	_logger(new Logger("RCON SESSION", LOG_LEVEL::DEBUG))
 {
 	// initialize the random number generator for picking the random packet ID.
 	this->_rng = std::mt19937(this->_rd());
@@ -17,7 +23,7 @@ void Rcon::connect()
 {
 	if (this->_connected)
 	{
-		std::cerr << "Socket already connected to RCON server. Please disconnect before starting another connection.\n";
+		this->_logger->error("Socket already connected to RCON server. Please disconnect before starting another connection.");
 		return;
 	}
 
@@ -25,7 +31,7 @@ void Rcon::connect()
 
 	if (this->_rcon_socket < 0)
 	{
-		std::cerr << "Failed to create socket!" << std::endl;
+		this->_logger->error("Failed to create socket.");
 		return;
 	}
 
@@ -35,36 +41,43 @@ void Rcon::connect()
 	socket_address.sin_port = htons(this->_rcon_addr.port);
 	socket_address.sin_addr.s_addr = inet_addr(this->_rcon_addr.ip.c_str());
 
-	fcntl(this->_rcon_socket, F_SETFL, O_NONBLOCK);
+	int connect_status = ::connect(this->_rcon_socket, (struct sockaddr *) &socket_address, sizeof(socket_address));
+	this->_logger->debug("CONNECT STATUS: " + std::to_string(connect_status));
+	this->_logger->debug("ERRNO = " + std::to_string(errno) + ": " + strerror(errno));
 
-	if (::connect(this->_rcon_socket, (struct sockaddr*) &socket_address, sizeof(socket_address)) == -1)
+	if (connect_status == -1 && errno != EINPROGRESS)
 	{
-		if (errno != EINPROGRESS) {
-			std::cerr << "Failed to connect to the RCON server.\n";
-			::close(this->_rcon_socket);
-			return;
-		}
+		this->_logger->error("Failed to connect to the RCON server.");
+		::close(this->_rcon_socket);
+		return;
 	}
 
+	fcntl(this->_rcon_socket, F_SETFL, O_NONBLOCK);
 
-	struct timeval timeout;
-	timeout.tv_sec = 1;
-	timeout.tv_usec = 0;
+	struct timeval select_timeout;
+	select_timeout.tv_sec = 2;
+	select_timeout.tv_usec = 0;
+
+	// Define our set of file descriptors, zero it out, and add our socket to the set.
 
 	fd_set write_set;
 	FD_ZERO(&write_set);
 	FD_SET(this->_rcon_socket, &write_set);
 
-	int status = select(this->_rcon_socket + 1, NULL, &write_set, NULL, &timeout);
-	LOGF("[DEBUG]: RCON Socket select status (write): %i\n", status);
-	this->_connected = status == 1;
+	int ready = select(this->_rcon_socket + 1, NULL, &write_set, NULL, &select_timeout);
+	this->_logger->debug("RCON socket select status (write): " + std::to_string(ready));
+	if (ready == 0) {
+		this->_logger->error("Socket timed out whilst waiting for connection.");
+		return;
+	}
+	this->_connected = (ready == 1);
 }
 
 bool Rcon::authenticate(std::string &server_password)
 {
 	if (!this->_connected)
 	{
-		std::cerr << "Socket not currently connected. Cannot authenticate.\n";
+		this->_logger->error("Socket not currently connected. Cannot authenticate.");
 		return false;
 	}
 	int packet_id = this->_default_dist(this->_rng);
@@ -73,20 +86,23 @@ bool Rcon::authenticate(std::string &server_password)
 	uint32_t packet_len = server_password.length() + PACKET_PADDING_SIZE;
 	auth_packet += int_to_le_string(packet_len);
 	auth_packet += int_to_le_string(packet_id);
-	auth_packet += int_to_le_string(PACKET_TYPE::SERVERDATA_AUTH);
+	auth_packet += int_to_le_string((int32_t) PACKET_TYPE::SERVERDATA_AUTH);
 	auth_packet += server_password;
 	auth_packet += '\0';
 	auth_packet += '\0';
 
 	bool success = this->_send_data(auth_packet);
+	if (success) this->_logger->info("Authentication successful.");
+	else         this->_logger->error("Authentication failed.");
 	printf("auth packet success: %s\n", (success ? "true" : "false"));
 	std::map<uint32_t, std::vector<std::string>> data = this->get_pending_data();
 
 	if (data.find(packet_id) != data.end() && data.at(packet_id).size() == 2)
 	{
-		printf("Successfully authenticated to the remote RCON server at %s:%hu\n", this->_rcon_addr.ip.c_str(), this->_rcon_addr.port);
+		this->_logger->info("Successfully authenticated to the remote RCON server at " + this->_rcon_addr.to_string());
 		return true;
 	}
+	this->_logger->error("Failed to authenticate with the remote RCON server.");
 	return false;
 }
 
@@ -111,28 +127,18 @@ std::map<uint32_t, std::vector<std::string>> Rcon::get_pending_data()
 	{
 		if (ready == -1 && tries == 2)
 		{
-			std::cerr << "Error reading the socket\nRan out of tries. Automatically disconnecting socket.\n";
+			this->_logger->error("LIBC \"select\" error (" + std::to_string(errno) + "): " + strerror(errno));
+			this->_logger->error("Ran out of tries. Automatically disconnecting socket.");
 			close();
 			break;
 		}
 		else if (ready == -1)
 		{
-			std::cerr << "Error reading the socket. Trying again...\n";
+			this->_logger->error("LIBC \"select\" error (" + std::to_string(errno) + "): " + strerror(errno));
+			this->_logger->info("Trying again to read socket.");
 			tries++;
 			continue;
 		}
-
-		// if (!ready && tries == 2)
-		// {
-		// 	std::cerr << "Error reading the socket\nSocket timed out.\n";
-		// 	break;
-		// }
-		// else if (!ready)
-		// {
-		// 	std::cerr << "Error reading the socket.\nSocket timed out.\nTrying again...\n";
-		// 	tries++;
-		// 	continue;
-		// }
 
 		char read_buff[MAX_PACKET_LENGTH];
 		::recv(this->_rcon_socket, &read_buff, sizeof(read_buff), 0);
@@ -148,30 +154,48 @@ std::map<uint32_t, std::vector<std::string>> Rcon::get_pending_data()
 		}
 		uint32_t packet_length;
 		std::memcpy(&packet_length, read_buff, sizeof(uint32_t));
-		incoming_packets.at(packet_id).push_back(std::string(read_buff, le32toh(packet_length) + sizeof(uint32_t)));
+		incoming_packets.at(packet_id).push_back(std::string(read_buff + sizeof(uint32_t), le32toh(packet_length)));
 	}
 
-	if (!ready && !num_packets) std::cerr << "Timeout limit reached.\n";
+	if (!ready && !num_packets) {
+
+		this->_logger->warn("Timeout limit reached.");
+		if (++this->_failed_packets == 3) {
+			this->_logger->error("Too many failed packets. Closing connection...");
+			this->close();
+		}
+	} else {
+		this->_failed_packets = 0;
+	}
 	
-	LOG("[DEBUG]: Successfully read: " << num_packets << (num_packets == 1 ? " packet" : " packets"));
+	this->_logger->debug("Successfully read " + std::to_string(num_packets) + (num_packets == 1 ? " packet." : " packets."));
 	return incoming_packets;
 }
 
-std::string Rcon::send_command(const std::string &command, Rcon::PACKET_TYPE type)
+void Rcon::get_socket_status() {
+	int error = 0;
+	socklen_t len = sizeof(error);
+	int result = getsockopt(this->_rcon_socket, SOL_SOCKET, SO_ERROR, &error, &len);
+	this->_logger->debug("get_socket_status result: " + std::to_string(result) + " | error: " + std::to_string(error));
+}
+
+std::string Rcon::send_command(const std::string &command, Rcon::PACKET_TYPE packet_type)
 {
+	this->get_socket_status();
 	if (!this->_connected)
 	{
-		std::cout << "Socket not currently connected. Socket must be connected to send data.\n";
+		this->_logger->error("Socket not currently connected. Socket must be connected to send data.");
 		return "";
 	}
 
-	uint32_t packet_id = this->_default_dist(this->_rng);
+	int32_t packet_id = this->_default_dist(this->_rng);
+	packet_id = abs(packet_id);
 
 	uint32_t packet_length = command.length() + PACKET_PADDING_SIZE;
 
 	std::string packet = int_to_le_string(packet_length);
 	packet += int_to_le_string(packet_id);
-	packet += int_to_le_string(type);
+	packet += int_to_le_string((int32_t) packet_type);
 	packet += command;
 	packet += '\x00';
 	packet += '\x00';
@@ -189,7 +213,14 @@ std::string Rcon::send_command(const std::string &command, Rcon::PACKET_TYPE typ
 		chunk = chunk.substr(sizeof(uint32_t) * 2);
 		final_data += chunk.substr(0, chunk.length() - 2);
 	}
+	this->_logger->print(LOG_LEVEL::DEBUG, "RESPONSE: ");
+	for (auto ch : final_data)
+	{
+		this->_logger->print(LOG_LEVEL::DEBUG, num_to_hex<uint8_t>(ch));
+	}
 
+	if (final_data.length() == 0) this->_logger->print(LOG_LEVEL::DEBUG, "(no response)");
+	this->_logger->println(LOG_LEVEL::DEBUG, "");
 	return final_data;
 }
 
@@ -211,38 +242,35 @@ bool Rcon::_send_data(const std::string &data)
 		ready = select(this->_rcon_socket + 1, NULL, &write_set, NULL, &timeout);
 		if (ready == -1)
 		{
-			LOGF("[DEBUG]: RCON Socket \"select\" error: %s (%i)\n", strerror(errno), errno);
-			ERRF("[ERROR]: %s (%i)\n", strerror(errno), errno);
+			this->_logger->error("LIBC \"select\" error (" + std::to_string(errno) + "): " + strerror(errno));
 			return false;
 		}
 		else if (ready == 0 && tries == 2)
 		{
-			LOG("[DEBUG]: RCON Socket timed out. Out of tries.");
-			ERR("[ERROR]: Failed to send data. (Socket timed out)");
+			this->_logger->error("Failed to send data. (Socket timed out)");
 			return false;
 		}
 		else if (ready == 0)
 		{
-			LOG("[DEBUG]: RCON Socket timed out. Trying again...");
+			this->_logger->warn("RCON Socket timed out. Trying again...");
 			tries++;
 			continue;
 		}
 	}
 
-	int status = 0;
+	int bytes_sent = 0;
 	tries = 0;
 
 	do {
-		status = send(this->_rcon_socket, data.c_str(), data.length(), 0);
-		if (status < 0)
+		bytes_sent = ::send(this->_rcon_socket, data.c_str(), data.length(), 0);
+		if (bytes_sent < 0)
 		{
-			LOGF("[DEBUG]: RCON Socket \"send\" error: %s (%i)\n", strerror(errno), errno);
-			ERRF("[ERROR]: %s (%i)\n", strerror(errno), errno);
+			this->_logger->error("LIBC \"send\" error (" + std::to_string(errno) + "): " + strerror(errno));
 			usleep(20000);
 			tries++;
 		}
-	} while (status < 0 && tries < 3);
-	return status > 0;
+	} while (bytes_sent < 0 && tries < 3);
+	return bytes_sent > 0;
 }
 
 std::string int_to_le_string(uint32_t number)

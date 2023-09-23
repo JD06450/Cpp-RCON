@@ -3,5 +3,5 @@ build/
 vcpkg_installed/
 
 open-rcon
-./*.so
+*.so
 docs/
